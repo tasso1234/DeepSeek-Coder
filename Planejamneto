@@ -1,0 +1,718 @@
+import pandas as pd
+from datetime import datetime, timedelta
+from google.colab import files
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import PatternFill
+
+# ===========================================================
+# 1. Configuração do Período, Datas e Parâmetros
+# ===========================================================
+start_date_str = input("Informe a data de início (YYYY-MM-DD): ")
+end_date_str   = input("Informe a data final (YYYY-MM-DD): ")
+
+start_date = datetime.strptime(start_date_str.strip(), "%Y-%m-%d")
+end_date   = datetime.strptime(end_date_str.strip(), "%Y-%m-%d")
+
+all_dates = []
+current_date = start_date
+while current_date <= end_date:
+    all_dates.append(current_date)
+    current_date += timedelta(days=1)
+print("Datas do período:", [d.strftime("%Y-%m-%d") for d in all_dates])
+if not all_dates:
+    raise ValueError("Nenhuma data encontrada no período informado.")
+
+excluded_input = input("Insira as datas a serem excluídas (YYYY-MM-DD, separadas por vírgula) ou deixe em branco: ")
+if excluded_input.strip() != "":
+    dias_excluidos = [datetime.strptime(x.strip(), "%Y-%m-%d") for x in excluded_input.split(",")]
+else:
+    dias_excluidos = []
+print("Dias excluídos:", [d.strftime("%Y-%m-%d") for d in dias_excluidos])
+
+def is_dia_util(date):
+    # Exclui domingos (weekday==6) e os dias explicitamente excluídos.
+    return (date.weekday() != 6) and (date not in dias_excluidos)
+
+# Apenas os dias úteis serão usados para produção
+production_days = [d for d in all_dates if is_dia_util(d)]
+print("Dias úteis (production_days):", [d.strftime("%Y-%m-%d") for d in production_days])
+if not production_days:
+    raise ValueError("Nenhum dia útil disponível.")
+
+# ===========================================================
+# 1.1 Entrada de MOD por Turno
+# ===========================================================
+max_func1 = float(input("Informe o número de funcionários disponíveis por hora para o Turno 1 (06:00-14:00): ").strip())
+max_func2 = float(input("Informe o número de funcionários disponíveis por hora para o Turno 2 (14:00-22:00): ").strip())
+max_func3 = float(input("Informe o número de funcionários disponíveis por hora para o Turno 3 (22:00-06:00): ").strip())
+shift_max = {1: max_func1, 2: max_func2, 3: max_func3}
+print(f"MOD por turno: {shift_max}")
+
+# ===========================================================
+# 1.2 Input de Prioridade das Linhas de Produção
+# ===========================================================
+line_priority_input = input("Informe as prioridades das linhas (ex: ENPL001A:1, ENPL001B:2). Se vazio, prioridade 999: ")
+line_priority = {}
+if line_priority_input.strip() != "":
+    for item in line_priority_input.split(","):
+        try:
+            line, prio = item.split(":")
+            line_priority[line.strip()] = int(prio.strip())
+        except Exception as e:
+            print(f"Erro ao processar '{item}'. Use o formato LINHA:PRIORIDADE.")
+else:
+    line_priority = {}
+
+# ===========================================================
+# 1.3 Turnos e Horários Permitidos
+# ===========================================================
+shift_allowed_hours = {
+    1: list(range(6, 14)),
+    2: list(range(14, 22)),
+    3: list(range(22, 24)) + list(range(0, 6))
+}
+global_allowed_hours = list(range(24))
+allowed_turnos = {}
+def get_allowed_hours_for_machine(machine_line):
+    if machine_line in allowed_turnos:
+        allowed = []
+        for s in allowed_turnos[machine_line]:
+            allowed.extend(shift_allowed_hours.get(s, []))
+        return sorted(list(set(allowed)))
+    else:
+        return global_allowed_hours
+
+def get_shift(hour):
+    if 6 <= hour < 14:
+        return 1
+    elif 14 <= hour < 22:
+        return 2
+    else:
+        return 3
+
+def avancar_ponteiro_turnos(data, current_hour, allowed_hours):
+    next_hours = [h for h in allowed_hours if h > current_hour]
+    if next_hours:
+        return data, next_hours[0]
+    else:
+        idx = production_days.index(data)
+        for j in range(idx+1, len(production_days)):
+            if is_dia_util(production_days[j]):
+                return production_days[j], allowed_hours[0]
+        raise ValueError("Fim dos dias úteis.")
+
+def calcular_indice_coluna_turnos(data, hour):
+    idx = production_days.index(data)
+    return idx * 24 + (hour + 1)
+
+def get_capacity_factor(hour):
+    if hour in [0, 1, 2, 9, 10, 11, 17, 18, 19]:
+        return 0.7
+    else:
+        return 1.0
+
+# ===========================================================
+# Helper: Dicionário de MOD por Dia
+# ===========================================================
+funcionarios_por_dia = {}
+def init_funcionarios_for_day(data):
+    data_str = data.strftime("%Y-%m-%d")
+    if data_str not in funcionarios_por_dia:
+        funcionarios_por_dia[data_str] = {h: 0 for h in range(24)}
+    return data_str
+
+# ===========================================================
+# Variáveis de Controle para Setup e Produção por Linha
+# ===========================================================
+ultimo_slot = {}   # Último slot de produção alocado para cada linha
+ultimo_sku = {}    # Último SKU alocado para cada linha
+
+# Variável global para contar setups simultâneos por slot (índice da timeline)
+setup_global_counter = {}
+
+# ===========================================================
+# Função de Alocação Fragmentada com Setup Obrigatório na Troca de SKU
+# (Utilizada para qualquer linha; agora aceita start_slot e evita >2 setups simultâneos)
+# ===========================================================
+def allocate_fragmented_sku_with_setup(linha, req_mod, required_hours, sku, new_group, start_slot=0):
+    """
+    Aloca os slots da timeline para o SKU, iniciando a busca a partir de start_slot.
+    Garante que, se houver mudança de SKU, seja inserido um bloco CONTÍNUO de 6 horas de setup
+    antes do início da produção do novo SKU. Além disso, verifica se cada slot do bloco a ser inserido
+    possui menos de 2 setups já alocados.
+    Retorna (lista de índices alocados, número total de horas alocadas).
+    """
+    tline = timeline[linha]
+    allocated_slots = []
+    if linha not in ultimo_sku:
+        ultimo_sku[linha] = None
+    for slot in range(start_slot, len(tline)):
+        day_idx = slot // 24
+        if day_idx >= len(production_days):
+            continue
+        hour = slot % 24
+        data_slot = production_days[day_idx]
+        data_str = data_slot.strftime("%Y-%m-%d")
+        init_funcionarios_for_day(data_slot)
+        
+        if tline[slot] != "":
+            continue
+        
+        allocated = funcionarios_por_dia[data_str][hour]
+        factor = get_capacity_factor(hour)
+        turno = get_shift(hour)
+        capacity = shift_max[turno] * factor
+        if capacity - allocated < req_mod:
+            continue
+        
+        # Se for o primeiro slot para este SKU num novo lote
+        if not allocated_slots:
+            # Verifica necessidade de setup se houve alteração de SKU
+            if ultimo_slot.get(linha) is not None and ultimo_sku[linha] != sku:
+                start_block = slot - 6
+                day_start = (slot // 24) * 24
+                if start_block < day_start:
+                    continue
+                can_setup = True
+                # Verifica se os 6 slots anteriores estão livres e com setup count < 2
+                for s in range(start_block, slot):
+                    if tline[s] != "" or setup_global_counter.get(s, 0) >= 2:
+                        can_setup = False
+                        break
+                if not can_setup:
+                    continue
+                # Insere o bloco de setup e atualiza o contador global para cada slot
+                for s in range(start_block, slot):
+                    tline[s] = "SETUP"
+                    setup_global_counter[s] = setup_global_counter.get(s, 0) + 1
+                if linha not in setups_info:
+                    setups_info[linha] = {"6h_count": 0, "6h_time": 0, "2h_count": 0, "2h_time": 0}
+                setups_info[linha]["6h_count"] += 1
+                setups_info[linha]["6h_time"] += 6
+            tline[slot] = sku
+            allocated_slots.append(slot)
+            ultimo_slot[linha] = slot
+            ultimo_sku[linha] = new_group
+        else:
+            # Se o slot continua a produção contígua no mesmo dia, aloca-o
+            if ultimo_slot[linha] is not None and slot == ultimo_slot[linha] + 1 and (slot // 24 == ultimo_slot[linha] // 24):
+                tline[slot] = sku
+                allocated_slots.append(slot)
+                ultimo_slot[linha] = slot
+            else:
+                tline[slot] = sku
+                allocated_slots.append(slot)
+                ultimo_slot[linha] = slot
+        if len(allocated_slots) >= required_hours:
+            break
+    return allocated_slots, len(allocated_slots)
+
+# ===========================================================
+# NOVA Função: Alocação Multilinha para um SKU
+# ===========================================================
+def allocate_multiline_sku(row):
+    """
+    Tenta alocar a produção do SKU inicialmente na linha principal (coluna "LINHA").
+    Se a linha principal não tiver capacidade completa, tenta alocar o restante
+    nas linhas alternativas (ex: "LINHA 2" e "LINHA 3").
+    
+    Se a linha especificada não existir na timeline, emite um aviso e ignora a alocação.
+    Adicionalmente, se na planilha "Produção Planejada" existir um valor na coluna "Prioridade",
+    esse valor (entre 1 e 31) indica o dia do mês em que o SKU deverá começar a ser produzido.
+    """
+    sku = row["COD SAP"]
+    if pd.isna(row["Tempo de Produção"]):
+        avisos_list.append(f"SKU {sku} com 'Tempo de Produção' ausente; ignorado.")
+        return
+    required_hours = int(float(row["Tempo de Produção"]))
+    req_mod = float(row["QT. FUM"])
+    prod_value = float(row["PROD.HORA"]) if not pd.isna(row["PROD.HORA"]) else 0
+    if prod_value * required_hours == 0:
+        avisos_list.append(f"SKU {sku} com volume zero; ignorado.")
+        return
+
+    new_sku = str(sku).upper()
+
+    primary_line = str(row["LINHA"]).strip() if pd.notna(row["LINHA"]) else None
+    if primary_line is None:
+        avisos_list.append(f"SKU {sku} sem linha principal definida; ignorado.")
+        return
+    if primary_line not in timeline:
+        avisos_list.append(f"SKU {sku}: linha principal '{primary_line}' não encontrada na timeline; ignorado.")
+        return
+
+    # Verifica se há valor na coluna Prioridade (dia do mês)
+    start_slot_index = 0
+    if "Prioridade" in row and not pd.isna(row["Prioridade"]):
+        try:
+            desired_day = int(row["Prioridade"])
+            found_date = None
+            for day in production_days:
+                if day.day == desired_day:
+                    found_date = day
+                    break
+            if found_date is not None:
+                start_slot_index = production_days.index(found_date) * 24
+        except Exception as e:
+            pass
+
+    alternative_lines = []
+    if "LINHA 2" in row and pd.notna(row["LINHA 2"]):
+        alternative_lines.append(str(row["LINHA 2"]).strip())
+    if "LINHA 3" in row and pd.notna(row["LINHA 3"]):
+        alternative_lines.append(str(row["LINHA 3"]).strip())
+
+    allocated_total = 0
+    indices, allocated = allocate_fragmented_sku_with_setup(primary_line, req_mod, required_hours, sku, new_sku, start_slot_index)
+    allocated_total += allocated
+    production_summary.setdefault((primary_line, sku), {"horas": 0, "quantidade": 0})
+    production_summary[(primary_line, sku)]["horas"] += allocated
+    production_summary[(primary_line, sku)]["quantidade"] += prod_value * allocated
+    for slot in indices:
+        day_idx = slot // 24
+        hour = slot % 24
+        data_slot = production_days[day_idx]
+        data_str = data_slot.strftime("%Y-%m-%d")
+        init_funcionarios_for_day(data_slot)
+        funcionarios_por_dia[data_str][hour] += req_mod
+
+    if allocated_total < required_hours:
+        restante = required_hours - allocated_total
+        for alt_line in alternative_lines:
+            if alt_line not in timeline:
+                avisos_list.append(f"SKU {sku}: linha alternativa '{alt_line}' não encontrada na timeline; ignorada.")
+                continue
+            indices_alt, allocated_alt = allocate_fragmented_sku_with_setup(alt_line, req_mod, restante, sku, new_sku, 0)
+            if allocated_alt > 0:
+                production_summary.setdefault((alt_line, sku), {"horas": 0, "quantidade": 0})
+                production_summary[(alt_line, sku)]["horas"] += allocated_alt
+                production_summary[(alt_line, sku)]["quantidade"] += prod_value * allocated_alt
+                for slot in indices_alt:
+                    day_idx = slot // 24
+                    hour = slot % 24
+                    data_slot = production_days[day_idx]
+                    data_str = data_slot.strftime("%Y-%m-%d")
+                    init_funcionarios_for_day(data_slot)
+                    funcionarios_por_dia[data_str][hour] += req_mod
+                allocated_total += allocated_alt
+                restante = required_hours - allocated_total
+            if restante <= 0:
+                break
+    if allocated_total < required_hours:
+        avisos_list.append(f"SKU {sku} não alocado completamente. Horas requeridas: {required_hours}, alocadas: {allocated_total}")
+
+# ===========================================================
+# 2. Upload e Leitura das Planilhas
+# ===========================================================
+def upload_planilha():
+    uploaded = files.upload()
+    for filename in uploaded.keys():
+        print(f"Arquivo {filename} carregado com sucesso.")
+    return list(uploaded.keys())[0]
+
+arquivo = upload_planilha()
+xlsx = pd.ExcelFile(arquivo)
+producao_planejada = pd.read_excel(xlsx, sheet_name="Produção Planejada")
+producao_hora = pd.read_excel(xlsx, sheet_name="Produção Hora a Hora")
+capacidade_df = pd.read_excel(xlsx, sheet_name="Capacidade por Linha")
+
+# Corrigindo o erro: tratar colunas que são datas
+producao_planejada.columns = [str(col).strip() if isinstance(col, str) else col for col in producao_planejada.columns]
+
+producao_hora = producao_hora.astype(object)
+expected_cols = 1 + len(production_days) * 24
+current_cols = producao_hora.shape[1]
+if current_cols < expected_cols:
+    for i in range(current_cols, expected_cols):
+        producao_hora[i] = ""
+    print(f"Planilha expandida de {current_cols} para {expected_cols} colunas.")
+
+# ===========================================================
+# 3. Mapeamento das Linhas de Produção e Timeline
+# ===========================================================
+linha_mapping = {}
+for i in range(1, producao_hora.shape[0]):
+    label = str(producao_hora.iat[i, 0]).strip()
+    if label:
+        linha_mapping[label] = i
+print("Mapping de linhas:", linha_mapping)
+
+total_hours = len(production_days) * 24
+timeline = {linha: [""] * total_hours for linha in linha_mapping.keys()}
+
+# ===========================================================
+# 3.1 Ordenar Planejamento (por prioridade e volume)
+# ===========================================================
+def get_line_priority(linha):
+    return line_priority.get(linha, 999)
+producao_planejada["PrioridadeLinha"] = producao_planejada["LINHA"].apply(lambda x: get_line_priority(str(x).strip()))
+producao_planejada["VolumeTotal"] = producao_planejada["Tempo de Produção"] * producao_planejada["PROD.HORA"]
+producao_planejada = producao_planejada.sort_values(by=["PrioridadeLinha", "VolumeTotal"], ascending=[True, False])
+
+# ===========================================================
+# 4. Ponteiros e Variáveis de Controle
+# ===========================================================
+ponteiro = {}
+ultimo_grupo = {}
+capacity_used = {}
+avisos_list = []
+setups_info = {}
+ultimo_sku = {}
+setup_flag = {}
+ultimo_slot = {}
+
+def get_initial_working_date(start_date, dates_list):
+    for d in dates_list:
+        if d >= start_date and is_dia_util(d):
+            return d
+    raise ValueError("Nenhum dia útil encontrado.")
+
+initial_date = get_initial_working_date(start_date, production_days)
+for linha in linha_mapping.keys():
+    ponteiro[linha] = (initial_date, get_allowed_hours_for_machine(linha)[0])
+    ultimo_grupo[linha] = None
+    capacity_used[linha] = 0
+    ultimo_sku[linha] = None
+    setup_flag[linha] = False
+    ultimo_slot[linha] = None
+
+# ===========================================================
+# 5. Capacidade por Linha
+# ===========================================================
+capacidade_df.columns = [col.strip() for col in capacidade_df.columns]
+line_capacity = {}
+if "Linha de Produção" in capacidade_df.columns and "Horas Disponiveis" in capacidade_df.columns:
+    for idx, row in capacidade_df.iterrows():
+        linha_cp = str(row["Linha de Produção"]).strip()
+        line_capacity[linha_cp] = row["Horas Disponiveis"]
+
+# ===========================================================
+# 6. Inserir Setup de 6 Horas (para alocação manual)
+# ===========================================================
+def alocar_setup_block(linha):
+    allowed = get_allowed_hours_for_machine(linha)
+    try:
+        data, hora = ponteiro[linha]
+        for _ in range(6):
+            col_index = calcular_indice_coluna_turnos(data, hora)
+            producao_hora.iat[linha_mapping[linha], col_index] = "SETUP"
+            capacity_used[linha] += 1
+            hora += 1
+            if hora >= 24:
+                break
+        if hora >= 24:
+            data, hora = avancar_ponteiro_turnos(data, 23, allowed)
+        ponteiro[linha] = (data, hora)
+        if linha not in setups_info:
+            setups_info[linha] = {"6h_count": 0, "6h_time": 0, "2h_count": 0, "2h_time": 0}
+        setups_info[linha]["6h_count"] += 1
+        setups_info[linha]["6h_time"] += 6
+    except ValueError:
+        pass
+
+# ===========================================================
+# 7. Alocação dos SKUs utilizando a função allocate_multiline_sku
+# ===========================================================
+production_summary = {}
+skus_nao_alocados = []
+
+for idx, row in producao_planejada.iterrows():
+    allocate_multiline_sku(row)
+
+# ===========================================================
+# 17. NOVA FUNÇÃO: Calcular Saldo e Realocar Produção
+# ===========================================================
+def calcular_saldo_e_realocar(producao_planejada, timeline, production_days, funcionarios_por_dia, shift_max, setups_info):
+    """
+    Calcula o saldo de produção não realizada para cada SKU e realoca o saldo na timeline.
+    """
+    for idx, row in producao_planejada.iterrows():
+        sku = row["COD SAP"]
+        linha_principal = str(row["LINHA"]).strip() if pd.notna(row["LINHA"]) else None
+        if linha_principal is None or linha_principal not in timeline:
+            continue
+
+        # Calcular produção planejada
+        tempo_producao = float(row["Tempo de Produção"])
+        prod_hora = float(row["PROD.HORA"]) if not pd.isna(row["PROD.HORA"]) else 0
+        producao_planejada_total = tempo_producao * prod_hora
+
+        # Calcular produção efetiva (soma das colunas de datas)
+        producao_efetiva_total = 0
+        for col in producao_planejada.columns:
+            if isinstance(col, str) and col.strip().startswith("20"):  # Verifica se é uma coluna de data
+                producao_efetiva_total += float(row[col]) if not pd.isna(row[col]) else 0
+
+        # Calcular saldo
+        saldo = producao_planejada_total - producao_efetiva_total
+        if saldo <= 0:
+            continue  # Não há saldo para realocar
+
+        # Verificar se PROD.HORA é zero
+        if prod_hora == 0:
+            avisos_list.append(f"SKU {sku} tem 'PROD.HORA' igual a zero; ignorado.")
+            continue  # Ignora este SKU e passa para o próximo
+
+        # Converter saldo em horas necessárias
+        horas_necessarias = saldo / prod_hora
+
+        # Realocar saldo na timeline
+        allocate_fragmented_sku_with_setup(
+            linha_principal,
+            float(row["QT. FUM"]),
+            horas_necessarias,
+            sku,
+            sku,
+            start_slot=0
+        )
+
+        # Atualizar funcionários por dia
+        for slot in timeline[linha_principal]:
+            if slot == sku:
+                day_idx = timeline[linha_principal].index(slot) // 24
+                hour = timeline[linha_principal].index(slot) % 24
+                data_slot = production_days[day_idx]
+                data_str = data_slot.strftime("%Y-%m-%d")
+                init_funcionarios_for_day(data_slot)
+                funcionarios_por_dia[data_str][hour] += float(row["QT. FUM"])
+
+# Chamar a função para calcular saldo e realocar
+calcular_saldo_e_realocar(producao_planejada, timeline, production_days, funcionarios_por_dia, shift_max, setups_info)
+
+# ===========================================================
+# 7.2 Reconstruir a planilha "Produção Hora a Hora" a partir da timeline
+# ===========================================================
+output_data = []
+for linha, tline in timeline.items():
+    output_data.append([linha] + tline)
+col_names = ["LINHA DE PRODUÇÃO"] + [f"H{i+1}" for i in range(total_hours)]
+producao_hora_final = pd.DataFrame(output_data, columns=col_names)
+
+# ===========================================================
+# 8. Aba de Resumo de Produção
+# ===========================================================
+resumo_df = pd.DataFrame([
+    {"Linha": linha, "SKU / COD SAP": sku, "Horas de Produção": data["horas"], "Quantidade Produzida (un)": data["quantidade"]}
+    for (linha, sku), data in production_summary.items()
+])
+if not resumo_df.empty:
+    total_horas = resumo_df["Horas de Produção"].sum()
+    total_quant = resumo_df["Quantidade Produzida (un)"].sum()
+    resumo_total = {
+        "Linha": "TOTAL",
+        "SKU / COD SAP": "-",
+        "Horas de Produção": total_horas,
+        "Quantidade Produzida (un)": total_quant
+    }
+    resumo_df = pd.concat([resumo_df, pd.DataFrame([resumo_total])], ignore_index=True)
+
+# ===========================================================
+# 9. Aba de Avisos
+# ===========================================================
+avisos_df = pd.DataFrame({"Avisos": avisos_list})
+
+# ===========================================================
+# 10. Aba de SKUs Não Alocados
+# ===========================================================
+nao_alocados_df = pd.DataFrame(skus_nao_alocados,
+    columns=["Linha(s) Tentadas", "SKU", "Horas Requeridas", "Horas Alocadas", "Quantidade Programada", "Quantidade Produzida", "Erro"])
+
+# ===========================================================
+# 11. Aba de Capacidade Disponível
+# ===========================================================
+prod_hora_dict = dict(zip(producao_planejada["COD SAP"], producao_planejada["PROD.HORA"]))
+# ADICIONADO: definição de funcionarios_sku para uso posterior
+funcionarios_sku = dict(zip(producao_planejada["COD SAP"], producao_planejada["QT. FUM"]))
+producao_efetiva = {}
+for (linha, sku), data in production_summary.items():
+    producao_efetiva[linha] = producao_efetiva.get(linha, 0) + data["quantidade"]
+
+capacidade_df.columns = [col.strip() for col in capacidade_df.columns]
+line_capacity = {}
+for idx, row in capacidade_df.iterrows():
+    linha_cp = str(row["Linha de Produção"]).strip()
+    line_capacity[linha_cp] = row["Horas Disponiveis"]
+
+capacidade_rows = []
+for linha, cap in line_capacity.items():
+    used = sum(1 for cell in timeline.get(linha, []) if cell not in ["", "SETUP"])
+    capacidade_rows.append({
+        "Linha": linha,
+        "Horas Disponíveis": cap,
+        "Horas Utilizadas": used,
+        "Horas Restantes": cap - used,
+        "Produção Efetiva": producao_efetiva.get(linha, 0)
+    })
+capacidade_disp_df = pd.DataFrame(capacidade_rows)
+
+# ===========================================================
+# 12. Aba de Setups
+# ===========================================================
+setups_rows = []
+for linha in linha_mapping.keys():
+    info = setups_info.get(linha, {"6h_count": 0, "6h_time": 0, "2h_count": 0, "2h_time": 0})
+    total_setup_count = info["6h_count"] + info["2h_count"]
+    total_setup_time = info["6h_time"] + info["2h_time"]
+    setups_rows.append({
+        "Linha": linha,
+        "Setup 6h Count": info["6h_count"],
+        "Setup 6h Tempo": info["6h_time"],
+        "Setup 2h Count": info["2h_count"],
+        "Setup 2h Tempo": info["2h_time"],
+        "Total Setups Count": total_setup_count,
+        "Total Setups Tempo": total_setup_time
+    })
+setups_df = pd.DataFrame(setups_rows)
+
+# ===========================================================
+# 13. Aba de SKUs Secundárias (apenas SKUs com produção em linhas alternativas)
+# ===========================================================
+sku_aggregates = {}
+for (linha, sku), data in production_summary.items():
+    sku = sku.upper()
+    if sku not in sku_aggregates:
+        sku_aggregates[sku] = {
+            "lines": set(),
+            "prod_by_line": {},
+            "planned_qty": 0,
+            "planned_primary": None,
+            "total_produced": 0
+        }
+    sku_aggregates[sku]["lines"].add(linha)
+    sku_aggregates[sku]["prod_by_line"][linha] = data["quantidade"]
+    sku_aggregates[sku]["total_produced"] += data["quantidade"]
+
+for idx, row in producao_planejada.iterrows():
+    sku_val = str(row["COD SAP"]).upper()
+    if sku_val in sku_aggregates and sku_aggregates[sku_val]["planned_primary"] is None:
+        sku_aggregates[sku_val]["planned_primary"] = str(row["LINHA"]).strip()
+        sku_aggregates[sku_val]["planned_qty"] = float(row["PROD.HORA"]) * int(float(row["Tempo de Produção"]))
+
+secundaria_rows = []
+for sku, info in sku_aggregates.items():
+    planned_primary = info["planned_primary"] if info["planned_primary"] is not None else ""
+    produzido_na_primaria = info["prod_by_line"].get(planned_primary, 0)
+    produzido_nas_outras = info["total_produced"] - produzido_na_primaria
+    if produzido_nas_outras > 0:
+        linhas_producao = ", ".join(sorted(list(info["lines"])))
+        secundaria_rows.append({
+            "SKU": sku,
+            "Linha Primária": planned_primary,
+            "Quantidade Programada": info["planned_qty"],
+            "Produzido na Linha Primária": produzido_na_primaria,
+            "Produzido nas Outras Linhas": produzido_nas_outras,
+            "Linha(s) Produção": linhas_producao
+        })
+secundaria_df = pd.DataFrame(secundaria_rows)
+
+# ===========================================================
+# 14. Aba de SKUs Não Produzidos
+# ===========================================================
+nao_produzidos_rows = []
+producao_por_sku = {}
+for (linha, sku), data in production_summary.items():
+    key = sku.upper()
+    producao_por_sku[key] = producao_por_sku.get(key, 0) + data["quantidade"]
+
+for idx, row in producao_planejada.iterrows():
+    sku_val = str(row["COD SAP"]).upper()
+    horas_requeridas = row["Tempo de Produção"]
+    prod_hora_planned = float(row["PROD.HORA"]) if not pd.isna(row["PROD.HORA"]) else 0
+    quant_programada = prod_hora_planned * float(horas_requeridas)
+    if sku_val not in producao_por_sku or producao_por_sku[sku_val] == 0:
+        nao_produzidos_rows.append({
+            "SKU": sku_val,
+            "Linha Planejada": str(row["LINHA"]).strip() if pd.notna(row["LINHA"]) else "",
+            "Horas Requeridas": horas_requeridas,
+            "Quantidade Programada": quant_programada,
+            "Produzido": 0,
+            "Erro": "Produção não realizada"
+        })
+nao_produzidos_df = pd.DataFrame(nao_produzidos_rows)
+
+# ===========================================================
+# 15. Aba de Resumo Diário
+# ===========================================================
+daily_production = {}
+for i, row in producao_hora_final.iterrows():
+    production_line = row.iloc[0]
+    for j in range(1, len(row)):
+        cell_value = row.iloc[j]
+        if cell_value and str(cell_value).strip() != "SETUP":
+            sku = str(cell_value).strip()
+            day_index = (j - 1) // 24
+            if day_index < len(production_days):
+                data_str = production_days[day_index].strftime("%Y-%m-%d")
+            else:
+                continue
+            prod_value = prod_hora_dict.get(sku, 0)
+            key = (production_line, sku, data_str)
+            daily_production[key] = daily_production.get(key, 0) + prod_value
+df_daily = pd.DataFrame([
+    {"Linha": linha, "SKU": sku, "Data": data, "Produção": prod}
+    for (linha, sku, data), prod in daily_production.items()
+])
+resumo_diario = df_daily.pivot_table(
+    index=["Linha", "SKU"],
+    columns="Data",
+    values="Produção",
+    aggfunc="sum",
+    fill_value=0
+)
+
+# ===========================================================
+# 19. Atualização da Aba "Resumo Diário" com Saldo
+# ===========================================================
+def atualizar_resumo_diario_com_saldo(resumo_diario, producao_planejada, timeline, production_days):
+    """
+    Atualiza a aba "Resumo Diário" com informações sobre o saldo de produção.
+    """
+    for idx, row in producao_planejada.iterrows():
+        sku = row["COD SAP"]
+        linha_principal = str(row["LINHA"]).strip() if pd.notna(row["LINHA"]) else None
+        if linha_principal is None or linha_principal not in timeline:
+            continue
+
+        # Calcular produção planejada e efetiva
+        tempo_producao = float(row["Tempo de Produção"])
+        prod_hora = float(row["PROD.HORA"]) if not pd.isna(row["PROD.HORA"]) else 0
+        producao_planejada_total = tempo_producao * prod_hora
+        producao_efetiva_total = 0
+        for col in producao_planejada.columns:
+            if isinstance(col, str) and col.strip().startswith("20"):
+                producao_efetiva_total += float(row[col]) if not pd.isna(row[col]) else 0
+
+        # Calcular saldo
+        saldo = producao_planejada_total - producao_efetiva_total
+
+        # Adicionar saldo ao resumo diário
+        if sku in resumo_diario.index:
+            resumo_diario.at[sku, "Saldo"] = saldo
+        else:
+            resumo_diario.loc[sku] = {"Saldo": saldo}
+
+# Chamar a função para atualizar o resumo diário
+atualizar_resumo_diario_com_saldo(resumo_diario, producao_planejada, timeline, production_days)
+
+# ===========================================================
+# 16. Salvar Arquivo Final e Fazer Download
+# ===========================================================
+output_file = "Produção_Final_Atualizada.xlsx"
+with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+    producao_hora_final.to_excel(writer, sheet_name="Produção Hora a Hora", index=False)
+    resumo_df.to_excel(writer, sheet_name="Resumo Produção por Linha", index=False)
+    avisos_df.to_excel(writer, sheet_name="Avisos", index=False)
+    nao_alocados_df.to_excel(writer, sheet_name="SKUs Não Alocados", index=False)
+    nao_produzidos_df.to_excel(writer, sheet_name="SKUs Não Produzidos", index=False)
+    capacidade_disp_df.to_excel(writer, sheet_name="Capacidade Disponível", index=False)
+    setups_df.to_excel(writer, sheet_name="Setups", index=False)
+    secundaria_df.to_excel(writer, sheet_name="SKUs Secundárias", index=False)
+    resumo_diario.to_excel(writer, sheet_name="Resumo Diário")
+print("Alocação concluída. O arquivo foi salvo.")
+
+# ===========================================================
+# 21. Fazer Download do Arquivo
+# ===========================================================
+files.download(output_file)
